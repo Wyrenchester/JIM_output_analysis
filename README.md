@@ -21,7 +21,7 @@
 
 • Per-particle output:
 
-&nbsp;	o Generates Excel tabs per particle with normalized intensity traces.
+&nbsp;	o Generates Excel tabs per particle with raw intensity traces.
 
 &nbsp;	o Saves plots of normalized intensity traces and HMM fits for visual inspection.
 
@@ -29,6 +29,9 @@
 
 &nbsp;	o Channel intensities for each behavior category are also outputted.
 
+• Aligned output:
+
+&nbsp;	o Particle intensities will be aligned at the 2nd drop in the user defined channel, and outputted for both channels, in raw and normalized format. (Normalization will be based upon the average intensity of the frames before the 2nd drop)
 
 
 

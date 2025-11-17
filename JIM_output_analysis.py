@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import filedialog
 import scipy as scipy
 from hmmlearn import hmm
+import xlsxwriter
 
 # -------------------------------
 # GUI TOOLTIP
@@ -278,10 +279,7 @@ def process():
         tracks = GreenData.copy()
         tracks['Mean Red Intensity'] = np.nan
 
-    # Remove particle ID = 0 (this is the row w/ frame numbers)
     tracks = tracks[tracks['Particle'] != 0]
-
-    # Sort globally by Frame then Particle
     tracks = tracks.sort_values(['Frame','Particle']).reset_index(drop=True)
 
     effective, lysis, uncoating, bad_particles, nonlytic = [], [], [], [], []
@@ -324,7 +322,6 @@ def process():
             makeplot(temp_X, Norm_G, Norm_R, np.zeros_like(temp_X), particle, folder_bad)
             continue
 
-        # Folder for bad particles
         folder_bad = os.path.join(new_folder, 'bad') if saveplot=='y' else '.'
 
         # Classify particle
@@ -377,7 +374,7 @@ def process():
     particle_xlsx = os.path.join(results_folder, f"{out_file_name}_particles.xlsx")
 
     writer = pd.ExcelWriter(particle_xlsx, engine='xlsxwriter')
-    subset_tracks = tracks[tracks['Particle'].isin(effective)]  # only non-bad particles
+    subset_tracks = tracks[tracks['Particle'].isin(effective)]
     for a in subset_tracks['Particle'].unique():
         sub = subset_tracks[subset_tracks['Particle'] == a].copy()
         sub['Time (min)'] = sub['Frame'] * sec_per_f / 60
@@ -386,74 +383,90 @@ def process():
             sub.to_excel(writer, sheet_name=f'Particle{a}', index=False)
     writer.close()
 
-    # === Build aligned Excel file if requested ===
-    if Align == "y":
-        aligned_hmm = pd.DataFrame()
-        aligned_align = pd.DataFrame()
-
-        for particle in effective:
-            pdata = tracks[tracks['Particle'] == particle].sort_values("Frame").reset_index(drop=True)
-
-            # select channel for HMM fit
-            trace_fit = pdata["Mean Red Intensity"] if Fit_targ=="red" else pdata["Mean Green Intensity"]
-
-            # perform HMM fit (reuse HMM_fit to get states)
-            hmm_result, _, _, _ = HMM_fit(trace_fit)
-
-            # detect frames of HMM state changes
-            state_changes = np.where(np.diff(hmm_result)!=0)[0]
-            if len(state_changes) < 2:
-                continue
-            second_change_frame = pdata.loc[state_changes[1], "Frame"]
-
-            # select alignment channel
-            trace_align = pdata["Mean Red Intensity"] if Align_channel=="red" else pdata["Mean Green Intensity"]
-
-            # subset frames including FramesBefore frames before drop
-            subset_mask = (pdata["Frame"] >= second_change_frame - FramesBefore)
-            subset = pdata.loc[subset_mask].copy()
-            subset["Aligned_Frame"] = subset["Frame"] - second_change_frame
-
-            # pivot by Aligned_Frame
-            hmm_channel_pvt = subset.pivot(index="Aligned_Frame", columns="Particle", values=trace_fit.name)
-            align_channel_pvt = subset.pivot(index="Aligned_Frame", columns="Particle", values=trace_align.name)
-
-            aligned_hmm = pd.concat([aligned_hmm, hmm_channel_pvt], axis=1)
-            aligned_align = pd.concat([aligned_align, align_channel_pvt], axis=1)
-
-        # save aligned excel
-        aligned_xlsx = os.path.join(results_folder, f"{out_file_name}_Aligned.xlsx")
-        with pd.ExcelWriter(aligned_xlsx, engine='xlsxwriter') as writer:
-            if not aligned_hmm.empty:
-                aligned_hmm.to_excel(writer, sheet_name=f"{Fit_targ}_HMMFitChannel")
-            if not aligned_align.empty:
-                aligned_align.to_excel(writer, sheet_name=f"{Align_channel}_AlignmentChannel")
-
-        print(f"\nAligned Excel file saved: {aligned_xlsx}")
-
     # === Build category summary dataframes ===
     categories = {
         "Lysis": lysis,
         "Uncoating": uncoating,
         "Nonlytic": nonlytic
     }
-
+    
     for cat_name, plist in categories.items():
         if not plist:
             continue
-
+    
         cat_df = tracks[tracks['Particle'].isin(plist)].copy()
         cat_df['Time (min)'] = cat_df['Frame'] * sec_per_f / 60
-
+    
         red_pivot = cat_df.pivot(index='Frame', columns='Particle', values='Mean Red Intensity')
         green_pivot = cat_df.pivot(index='Frame', columns='Particle', values='Mean Green Intensity')
-
+    
         cat_xlsx = os.path.join(results_folder, f"{out_file_name}_{cat_name}.xlsx")
         with pd.ExcelWriter(cat_xlsx, engine='xlsxwriter') as cat_writer:
             red_pivot.to_excel(cat_writer, sheet_name='Red')
             green_pivot.to_excel(cat_writer, sheet_name='Green')
 
+    # === Build aligned normalized Excel for uncoating particles ===
+    aligned_raw_R, aligned_raw_G = {}, {}
+    aligned_norm_R, aligned_norm_G = {}, {}
+
+    for particle in uncoating:
+        pdata = tracks[tracks['Particle'] == particle].sort_values('Frame').reset_index(drop=True)
+        drop_channel = pdata['Mean Red Intensity'] if Fit_targ == 'red' else pdata['Mean Green Intensity']
+        align_channel_R = pdata['Mean Red Intensity']
+        align_channel_G = pdata['Mean Green Intensity']
+
+        # HMM fit for drop detection
+        hmm_result, _, _, evalu_b = HMM_fit(drop_channel)
+        stage_changes = np.where(np.diff(hmm_result) != 0)[0]
+        if len(stage_changes) < 2:
+            continue
+
+        second_drop_idx = stage_changes[1] + 1
+        start_idx = max(second_drop_idx - FramesBefore, 0)
+
+        # Slice frames: from start_idx to end
+        aligned_slice_R = align_channel_R.iloc[start_idx:].copy()
+        aligned_slice_G = align_channel_G.iloc[start_idx:].copy()
+
+        # Normalize based on mean of frames before 2nd drop
+        pre_mean_R = aligned_slice_R.iloc[:FramesBefore].mean()
+        pre_mean_G = aligned_slice_G.iloc[:FramesBefore].mean()
+        normalized_R = aligned_slice_R / pre_mean_R * 100
+        normalized_G = aligned_slice_G / pre_mean_G * 100
+
+        aligned_raw_R[particle] = aligned_slice_R.values
+        aligned_raw_G[particle] = aligned_slice_G.values
+        aligned_norm_R[particle] = normalized_R.values
+        aligned_norm_G[particle] = normalized_G.values
+
+    # Helper to build padded DataFrame with Frame & Time
+    def build_aligned_tab(aligned_dict):
+        if not aligned_dict:
+            return pd.DataFrame()
+        max_len = max(len(v) for v in aligned_dict.values())
+        padded = {k: np.pad(np.array(v, dtype=float), (0, max_len-len(v)), constant_values=np.nan) 
+                  for k,v in aligned_dict.items()}
+        frame_col = np.arange(-FramesBefore, -FramesBefore + max_len)
+        time_col = frame_col * sec_per_f / 60
+        df = pd.DataFrame(padded)
+        df.insert(0, 'Time (min)', time_col)
+        df.insert(0, 'Frame', frame_col)
+        return df
+
+    # --- Save aligned normalized Excel file ---
+    aligned_xlsx = os.path.join(results_folder, f"{out_file_name}_Aligned.xlsx")
+    with pd.ExcelWriter(aligned_xlsx, engine='xlsxwriter') as writer:
+        if aligned_raw_R:
+            build_aligned_tab(aligned_raw_R).to_excel(writer, sheet_name='Aligned_Raw_Red', index=False)
+        if aligned_raw_G:
+            build_aligned_tab(aligned_raw_G).to_excel(writer, sheet_name='Aligned_Raw_Green', index=False)
+        if aligned_norm_R:
+            build_aligned_tab(aligned_norm_R).to_excel(writer, sheet_name='Aligned_Normalized_Red', index=False)
+        if aligned_norm_G:
+            build_aligned_tab(aligned_norm_G).to_excel(writer, sheet_name='Aligned_Normalized_Green', index=False)
+
     print(f"\nAnalysis complete. Files saved in: {results_folder}")
+
 
 # -------------------------------
 # BUTTONS
